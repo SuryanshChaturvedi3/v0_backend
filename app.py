@@ -44,8 +44,8 @@ if __name__ == '__main__':
             host='0.0.0.0',
             port=5001,
             debug=False,
-            use_reloader=True,
-            log_output=False,
+            use_reloader=False,   
+            log_output=True,
             allow_unsafe_werkzeug=True
         )
     except KeyboardInterrupt:

@@ -5,6 +5,111 @@ from . import score_bp
 from socket_instance import socketio
 from flask_cors import cross_origin
 
+# ---------------------------------------------------------------------------
+# WALKOVER ENDPOINT
+# ---------------------------------------------------------------------------
+
+
+@score_bp.route('/declare-walkover', methods=['POST'])
+def declare_walkover():
+    """
+    Declare a walkover for a match.
+
+    Request body:
+        {
+            "match_id":      <int>,
+            "tournament_id": <int>,
+            "winner_team_id": <str>   -- must be team1_id or team2_id of the match
+        }
+
+    On success:
+        - match.outcome_type  = 'walkover'
+        - match.winner_team_id = winner_team_id
+        - match.is_final       = True
+        - match.status         = 'completed'
+        - Score rows inserted as 1-0 (winner=1, loser=0) so that existing
+          standings SQL — which counts wins by comparing scores — counts this
+          match correctly without any SQL changes.
+        - If the match has a successor (knockout bracket), the winner is
+          propagated using the same update_successor_match() used by normal
+          matches, keeping knockout progression identical.
+    """
+    data = request.get_json()
+
+    match_id      = data.get('match_id')
+    tournament_id = data.get('tournament_id')
+    winner_team_id = data.get('winner_team_id')
+
+    # --- Basic field validation ---
+    if not all([match_id, tournament_id, winner_team_id]):
+        return jsonify({'error': 'match_id, tournament_id, and winner_team_id are required'}), 400
+
+    try:
+        match = Match.query.filter_by(id=match_id, tournament_id=tournament_id).first()
+        if not match:
+            return jsonify({'error': 'Match not found'}), 404
+
+        # --- Winner must belong to this match ---
+       
+        if winner_team_id not in (match.team1_id, match.team2_id):
+            return jsonify({
+                'error': f'winner_team_id {winner_team_id} is not a participant in match {match_id}. '
+                         f'Must be {match.team1_id} or {match.team2_id}'
+            }), 400
+
+        # --- State guard: don't re-declare on an already-finished match ---
+        if match.is_final:
+            return jsonify({
+                'error': 'Match is already finalized. Use override flow if needed.'
+            }), 400
+
+        loser_team_id = match.team2_id if winner_team_id == match.team1_id else match.team1_id
+
+        # --- Set match outcome fields ---
+        match.outcome_type    = 'walkover'
+        match.winner_team_id  = winner_team_id
+        match.is_final        = True
+        match.status          = 'completed'
+
+        def upsert_score(team_id, value):
+            record = Score.query.filter_by(
+                match_id=match_id, team_id=team_id, tournament_id=tournament_id
+            ).first()
+            if record:
+                record.score = value
+            else:
+                db.session.add(Score(
+                    match_id=match_id,
+                    team_id=team_id,
+                    score=value,
+                    tournament_id=tournament_id
+                ))
+
+        upsert_score(winner_team_id, 1)
+        upsert_score(loser_team_id,  0)
+
+       
+        if match.successor:
+            update_successor_match(match.successor, match.id, match.winner_team_id)
+
+        db.session.commit()
+
+        return jsonify({
+            'message':        'Walkover declared successfully',
+            'match_id':       match_id,
+            'tournament_id':  tournament_id,
+            'outcome_type':   match.outcome_type,
+            'winner_team_id': match.winner_team_id,
+            'is_final':       match.is_final,
+            'status':         match.status
+        }), 200
+
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
 def update_successor_match(successor_match_id, current_match_id, winning_team_id):
     """Updates the successor match with the winning team"""
     try:
@@ -274,7 +379,11 @@ def get_match_score():
             },
             'status': match.status,
             'is_final': match.is_final,
-            'winner_team_id': match.winner_team_id
+            'winner_team_id': match.winner_team_id,
+            # outcome_type tells the frontend HOW the match ended.
+            # 'normal'   → show numeric scores
+            # 'walkover' → show Walkover badge instead of scores
+            'outcome_type': match.outcome_type or 'normal'
         }
         
         return jsonify(response), 200
